@@ -1082,6 +1082,20 @@ const migrateConfig = {
       }
     })
     return state
+  },
+  '71': (state: RootState) => {
+    const appIds = ['dify', 'wpslingxi', 'lechat', 'abacus', 'lambdachat']
+
+    if (state.minapps) {
+      appIds.forEach((id) => {
+        const app = DEFAULT_MIN_APPS.find((app) => app.id === id)
+        if (app) {
+          state.minapps.enabled.push(app)
+        }
+      })
+    }
+
+    return state
   }
 }
 
