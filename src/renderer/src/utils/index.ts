@@ -1,7 +1,8 @@
-import { FileType, Model } from '@renderer/types'
+import i18n from '@renderer/i18n'
+import { Model } from '@renderer/types'
 import { ModalFuncProps } from 'antd/es/modal/interface'
 import imageCompression from 'browser-image-compression'
-import html2canvas from 'html2canvas'
+import * as htmlToImage from 'html-to-image'
 // @ts-ignore next-line`
 import { v4 as uuidv4 } from 'uuid'
 
@@ -121,6 +122,19 @@ export function getLeadingEmoji(str: string): string {
   const emojiRegex = /^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)+/u
   const match = str.match(emojiRegex)
   return match ? match[0] : ''
+}
+
+export function isEmoji(str: string) {
+  if (str.startsWith('data:')) {
+    return false
+  }
+
+  if (str.startsWith('http')) {
+    return false
+  }
+
+  const emojiRegex = /^(\p{Emoji_Presentation}|\p{Emoji}\uFE0F)+/u
+  return str.match(emojiRegex)
 }
 
 export function isFreeModel(model: Model) {
@@ -266,7 +280,7 @@ export function getFileExtension(filePath: string) {
 export async function captureDiv(divRef: React.RefObject<HTMLDivElement>) {
   if (divRef.current) {
     try {
-      const canvas = await html2canvas(divRef.current)
+      const canvas = await htmlToImage.toCanvas(divRef.current)
       const imageData = canvas.toDataURL('image/png')
       return imageData
     } catch (error) {
@@ -298,29 +312,47 @@ export const captureScrollableDiv = async (divRef: React.RefObject<HTMLDivElemen
       div.style.overflow = 'visible'
       div.style.position = 'static'
 
-      // Configure html2canvas options
-      const canvas = await html2canvas(div, {
-        scrollY: -window.scrollY,
-        windowHeight: document.documentElement.scrollHeight,
-        useCORS: true, // Allow cross-origin images
-        allowTaint: true, // Allow cross-origin images
-        logging: false, // Disable logging
-        imageTimeout: 0, // Disable image timeout
-        onclone: (clonedDoc) => {
-          // Ensure all images in cloned document are loaded
-          const images = clonedDoc.getElementsByTagName('img')
-          return Promise.all(
-            Array.from(images).map((img) => {
-              if (img.complete) {
-                return Promise.resolve()
-              }
-              return new Promise((resolve) => {
-                img.onload = resolve
-                img.onerror = resolve
-              })
-            })
-          )
-        }
+      // calculate the size of the div
+      const totalWidth = div.scrollWidth
+      const totalHeight = div.scrollHeight
+
+      // check if the size of the div is too large
+      const MAX_ALLOWED_DIMENSION = 32767 // the maximum allowed pixel size
+      if (totalHeight > MAX_ALLOWED_DIMENSION || totalWidth > MAX_ALLOWED_DIMENSION) {
+        // restore the original styles
+        div.style.height = originalStyle.height
+        div.style.maxHeight = originalStyle.maxHeight
+        div.style.overflow = originalStyle.overflow
+        div.style.position = originalStyle.position
+
+        // restore the original scroll position
+        setTimeout(() => {
+          div.scrollTop = originalScrollTop
+        }, 0)
+
+        window.message.error({
+          content: i18n.t('message.error.dimension_too_large'),
+          key: 'export-error'
+        })
+        return Promise.reject()
+      }
+
+      const canvas = await new Promise<HTMLCanvasElement>((resolve, reject) => {
+        htmlToImage
+          .toCanvas(div, {
+            backgroundColor: getComputedStyle(div).getPropertyValue('--color-background'),
+            cacheBust: true,
+            pixelRatio: window.devicePixelRatio,
+            skipAutoScale: true,
+            canvasWidth: div.scrollWidth,
+            canvasHeight: div.scrollHeight,
+            style: {
+              backgroundColor: getComputedStyle(div).backgroundColor,
+              color: getComputedStyle(div).color
+            }
+          })
+          .then((canvas) => resolve(canvas))
+          .catch((error) => reject(error))
       })
 
       // Restore original styles
@@ -329,7 +361,7 @@ export const captureScrollableDiv = async (divRef: React.RefObject<HTMLDivElemen
       div.style.overflow = originalStyle.overflow
       div.style.position = originalStyle.position
 
-      const imageData = canvas.toDataURL('image/png')
+      const imageData = canvas
 
       // Restore original scroll position
       setTimeout(() => {
@@ -345,6 +377,21 @@ export const captureScrollableDiv = async (divRef: React.RefObject<HTMLDivElemen
   return Promise.resolve(undefined)
 }
 
+export const captureScrollableDivAsDataURL = async (divRef: React.RefObject<HTMLDivElement>) => {
+  return captureScrollableDiv(divRef).then((canvas) => {
+    if (canvas) {
+      return canvas.toDataURL('image/png')
+    }
+    return Promise.resolve(undefined)
+  })
+}
+
+export const captureScrollableDivAsBlob = async (divRef: React.RefObject<HTMLDivElement>, func: BlobCallback) => {
+  await captureScrollableDiv(divRef).then((canvas) => {
+    canvas?.toBlob(func, 'image/png')
+  })
+}
+
 export function hasPath(url: string): boolean {
   try {
     const parsedUrl = new URL(url)
@@ -355,9 +402,7 @@ export function hasPath(url: string): boolean {
   }
 }
 
-export function formatFileSize(file: FileType) {
-  const size = file.size
-
+export function formatFileSize(size: number) {
   if (size > 1024 * 1024) {
     return (size / 1024 / 1024).toFixed(1) + ' MB'
   }
@@ -403,6 +448,30 @@ export function modalConfirm(params: ModalFuncProps) {
       onCancel: () => resolve(false)
     })
   })
+}
+
+export function getTitleFromString(str: string, length: number = 80) {
+  let title = str.split('\n')[0]
+
+  if (title.includes('。')) {
+    title = title.split('。')[0]
+  } else if (title.includes('，')) {
+    title = title.split('，')[0]
+  } else if (title.includes('.')) {
+    title = title.split('.')[0]
+  } else if (title.includes(',')) {
+    title = title.split(',')[0]
+  }
+
+  if (title.length > length) {
+    title = title.slice(0, length)
+  }
+
+  if (!title) {
+    title = str.slice(0, length)
+  }
+
+  return title
 }
 
 export { classNames }

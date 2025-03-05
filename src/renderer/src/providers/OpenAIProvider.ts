@@ -1,9 +1,16 @@
-import { getOpenAIWebSearchParams, isReasoningModel, isSupportedModel, isVisionModel } from '@renderer/config/models'
+import { DEFAULT_MAX_TOKENS } from '@renderer/config/constant'
+import {
+  getOpenAIWebSearchParams,
+  isOpenAIoSeries,
+  isReasoningModel,
+  isSupportedModel,
+  isVisionModel
+} from '@renderer/config/models'
 import { getStoreSetting } from '@renderer/hooks/useSettings'
 import i18n from '@renderer/i18n'
 import { getAssistantSettings, getDefaultModel, getTopNamingModel } from '@renderer/services/AssistantService'
 import { EVENT_NAMES } from '@renderer/services/EventService'
-import { filterContextMessages } from '@renderer/services/MessagesService'
+import { filterContextMessages, filterUserRoleStartMessages } from '@renderer/services/MessagesService'
 import { Assistant, FileTypes, GenerateImageParams, Message, Model, Provider, Suggestion } from '@renderer/types'
 import { removeSpecialCharacters } from '@renderer/utils'
 import { takeRight } from 'lodash'
@@ -16,6 +23,8 @@ import {
 
 import { CompletionsParams } from '.'
 import BaseProvider from './BaseProvider'
+
+type ReasoningEffort = 'high' | 'medium' | 'low'
 
 export default class OpenAIProvider extends BaseProvider {
   private sdk: OpenAI
@@ -42,7 +51,7 @@ export default class OpenAIProvider extends BaseProvider {
   }
 
   private get isNotSupportFiles() {
-    const providers = ['deepseek', 'baichuan', 'minimax', 'doubao']
+    const providers = ['deepseek', 'baichuan', 'minimax', 'doubao', 'xirang']
     return providers.includes(this.provider.id)
   }
 
@@ -156,9 +165,45 @@ export default class OpenAIProvider extends BaseProvider {
     }
 
     if (isReasoningModel(model)) {
-      return {
-        reasoning_effort: assistant?.settings?.reasoning_effort
+      if (model.provider === 'openrouter') {
+        return {
+          reasoning: {
+            effort: assistant?.settings?.reasoning_effort
+          }
+        }
       }
+
+      if (isOpenAIoSeries(model)) {
+        return {
+          reasoning_effort: assistant?.settings?.reasoning_effort
+        }
+      }
+
+      if (model.id.includes('claude-3.7-sonnet') || model.id.includes('claude-3-7-sonnet')) {
+        const effortRatios: Record<ReasoningEffort, number> = {
+          high: 0.8,
+          medium: 0.5,
+          low: 0.2
+        }
+
+        const effort = assistant?.settings?.reasoning_effort as ReasoningEffort
+        const effortRatio = effortRatios[effort]
+
+        if (!effortRatio) {
+          return {}
+        }
+
+        const maxTokens = assistant?.settings?.maxTokens || DEFAULT_MAX_TOKENS
+        const budgetTokens = Math.trunc(Math.max(Math.min(maxTokens * effortRatio, 32000), 1024))
+
+        return {
+          thinking: {
+            budget_tokens: budgetTokens
+          }
+        }
+      }
+
+      return {}
     }
 
     return {}
@@ -175,7 +220,7 @@ export default class OpenAIProvider extends BaseProvider {
 
     let systemMessage = assistant.prompt ? { role: 'system', content: assistant.prompt } : undefined
 
-    if (['o1', 'o1-2024-12-17'].includes(model.id) || model.id.startsWith('o3')) {
+    if (isOpenAIoSeries(model)) {
       systemMessage = {
         role: 'developer',
         content: `Formatting re-enabled${systemMessage ? '\n' + systemMessage.content : ''}`
@@ -184,14 +229,8 @@ export default class OpenAIProvider extends BaseProvider {
 
     const userMessages: ChatCompletionMessageParam[] = []
 
-    const _messages = filterContextMessages(takeRight(messages, contextCount + 1))
+    const _messages = filterUserRoleStartMessages(filterContextMessages(takeRight(messages, contextCount + 1)))
     onFilterMessages(_messages)
-
-    if (model.id === 'deepseek-reasoner') {
-      if (_messages[0]?.role !== 'user') {
-        userMessages.push({ role: 'user', content: '' })
-      }
-    }
 
     for (const message of _messages) {
       userMessages.push(await this.getMessageParam(message, model))
@@ -207,27 +246,66 @@ export default class OpenAIProvider extends BaseProvider {
     }
 
     let hasReasoningContent = false
-    const isReasoningJustDone = (delta: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta) =>
-      hasReasoningContent ? !!delta?.content : delta?.content === '</think>'
+    let lastChunk = ''
+    const isReasoningJustDone = (
+      delta: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta & {
+        reasoning_content?: string
+        reasoning?: string
+        thinking?: string
+      }
+    ) => {
+      if (!delta?.content) return false
+
+      // 检查当前chunk和上一个chunk的组合是否形成###Response标记
+      const combinedChunks = lastChunk + delta.content
+      lastChunk = delta.content
+
+      // 检测思考结束
+      if (combinedChunks.includes('###Response') || delta.content === '</think>') {
+        return true
+      }
+
+      // 如果有reasoning_content或reasoning，说明是在思考中
+      if (delta?.reasoning_content || delta?.reasoning || delta?.thinking) {
+        hasReasoningContent = true
+      }
+
+      // 如果之前有reasoning_content或reasoning，现在有普通content，说明思考结束
+      if (hasReasoningContent && delta.content) {
+        return true
+      }
+
+      return false
+    }
 
     let time_first_token_millsec = 0
     let time_first_content_millsec = 0
     const start_time_millsec = new Date().getTime()
+    const lastUserMessage = _messages.findLast((m) => m.role === 'user')
+    const { abortController, cleanup } = this.createAbortController(lastUserMessage?.id)
+    const { signal } = abortController
 
-    // @ts-ignore key is not typed
-    const stream = await this.sdk.chat.completions.create({
-      model: model.id,
-      messages: [systemMessage, ...userMessages].filter(Boolean) as ChatCompletionMessageParam[],
-      temperature: this.getTemperature(assistant, model),
-      top_p: this.getTopP(assistant, model),
-      max_tokens: maxTokens,
-      keep_alive: this.keepAliveTime,
-      stream: isSupportStreamOutput(),
-      ...this.getReasoningEffort(assistant, model),
-      ...getOpenAIWebSearchParams(assistant, model),
-      ...this.getProviderSpecificParameters(assistant, model),
-      ...this.getCustomParameters(assistant)
-    })
+    const stream = await this.sdk.chat.completions
+      // @ts-ignore key is not typed
+      .create(
+        {
+          model: model.id,
+          messages: [systemMessage, ...userMessages].filter(Boolean) as ChatCompletionMessageParam[],
+          temperature: this.getTemperature(assistant, model),
+          top_p: this.getTopP(assistant, model),
+          max_tokens: maxTokens,
+          keep_alive: this.keepAliveTime,
+          stream: isSupportStreamOutput(),
+          ...getOpenAIWebSearchParams(assistant, model),
+          ...this.getReasoningEffort(assistant, model),
+          ...this.getProviderSpecificParameters(assistant, model),
+          ...this.getCustomParameters(assistant)
+        },
+        {
+          signal
+        }
+      )
+      .finally(cleanup)
 
     if (!isSupportStreamOutput()) {
       const time_completion_millsec = new Date().getTime() - start_time_millsec
@@ -242,6 +320,7 @@ export default class OpenAIProvider extends BaseProvider {
       })
     }
 
+    // @ts-expect-error `stream` is not typed
     for await (const chunk of stream) {
       if (window.keyv.get(EVENT_NAMES.CHAT_COMPLETION_PAUSED)) {
         break
@@ -249,8 +328,7 @@ export default class OpenAIProvider extends BaseProvider {
 
       const delta = chunk.choices[0]?.delta
 
-      // @ts-expect-error `reasoning_content` not supported by OpenAI for now
-      if (delta?.reasoning_content) {
+      if (delta?.reasoning_content || delta?.reasoning) {
         hasReasoningContent = true
       }
 
